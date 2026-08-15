@@ -238,6 +238,8 @@ class IntersectionStats:
         self.candidate_meshes = 0
         self.visibility_disqualified_meshes = 0
         self.visible_candidate_meshes = 0
+        self.visibility_filter_seconds = 0.0
+        self.source_preparation_seconds = 0.0
         self.broad_phase_rejections = 0
         self.mesh_pairs_tested = 0
         self.edges_considered = 0
@@ -282,6 +284,8 @@ class IntersectionStats:
             "candidate_meshes": self.candidate_meshes,
             "visibility_disqualified_meshes": self.visibility_disqualified_meshes,
             "visible_candidate_meshes": self.visible_candidate_meshes,
+            "visibility_filter_seconds": self.visibility_filter_seconds,
+            "source_preparation_seconds": self.source_preparation_seconds,
             "broad_phase_rejections": self.broad_phase_rejections,
             "mesh_pairs_tested": self.mesh_pairs_tested,
             "edges_considered": self.edges_considered,
@@ -534,12 +538,29 @@ def _eligible_mesh_candidates(
     scene_shapes,
     source_transforms,
     visibility: PanelVisibility,
+    stats=None,
 ):
     """Resolve visible, non-source candidates before geometric processing."""
 
     candidates = []
     disqualified_count = 0
-    for candidate_shape in scene_shapes:
+    scene_mesh_count = len(scene_shapes)
+    for index, candidate_shape in enumerate(scene_shapes, start=1):
+        if stats is not None and (
+            index == 1 or index % 10 == 0 or index == scene_mesh_count
+        ):
+            _update_progress_window(
+                stats,
+                index,
+                max(scene_mesh_count + 1, 1),
+                "Filtering viewport visibility: {} of {} scene meshes".format(
+                    index,
+                    scene_mesh_count,
+                ),
+            )
+            if _cancel_requested(stats, force=True):
+                break
+
         candidate_transform = (
             cmds.listRelatives(
                 candidate_shape,
@@ -661,6 +682,28 @@ def _pump_ui_events() -> None:
     else:
         # Yield briefly so Escape can be delivered when Qt bindings are absent.
         cmds.pause(seconds=0.001)
+
+
+def _update_progress_window(
+    stats: IntersectionStats,
+    progress: int,
+    maximum: int,
+    status: str,
+) -> None:
+    """Update and repaint the floating progress window when available."""
+
+    if not stats.progress_open:
+        return
+    try:
+        cmds.progressWindow(
+            edit=True,
+            progress=progress,
+            maxValue=maximum,
+            status=status,
+        )
+        _pump_ui_events()
+    except RuntimeError:
+        stats.progress_open = False
 
 
 def _cancel_requested(stats: IntersectionStats, force=False) -> bool:
@@ -906,35 +949,16 @@ def add_intersecting_geometry_to_selection(
     added_transforms: set[str] = set()
     stats = IntersectionStats(len(scene_shapes))
     LAST_RUN_STATS = stats
-    visibility = PanelVisibility(panel)
-    source_transforms = {
-        (
-            cmds.listRelatives(shape, parent=True, fullPath=True)
-            or [shape]
-        )[0]
-        for shape in source_shapes
-    }
-    # Resolve visibility before opening the progress bar so its denominator
-    # describes only meshes eligible for geometric processing.
-    candidates, stats.visibility_disqualified_meshes = (
-        _eligible_mesh_candidates(
-            scene_shapes,
-            source_transforms,
-            visibility,
-        )
-    )
-
-    stats.candidate_meshes = len(candidates)
-    stats.visible_candidate_meshes = len(candidates)
+    candidates = []
 
     try:
         try:
             stats.progress_open = bool(
                 cmds.progressWindow(
                     title="Select Intersecting Geometry",
-                    status="Preparing visible mesh candidates...",
+                    status="Starting viewport visibility scan...",
                     progress=0,
-                    maxValue=max(len(candidates), 1),
+                    maxValue=max(len(scene_shapes) + 1, 1),
                     isInterruptable=True,
                 )
             )
@@ -942,20 +966,65 @@ def add_intersecting_geometry_to_selection(
             # The search can still run if another progress window is open.
             pass
 
-        source_data = [MeshData(shape) for shape in source_shapes]
+        visibility_started_at = time.perf_counter()
+        visibility = PanelVisibility(panel)
+        source_transforms = {
+            (
+                cmds.listRelatives(shape, parent=True, fullPath=True)
+                or [shape]
+            )[0]
+            for shape in source_shapes
+        }
+        candidates, stats.visibility_disqualified_meshes = (
+            _eligible_mesh_candidates(
+                scene_shapes,
+                source_transforms,
+                visibility,
+                stats=stats,
+            )
+        )
+        stats.visibility_filter_seconds = (
+            time.perf_counter() - visibility_started_at
+        )
+        stats.candidate_meshes = len(candidates)
+        stats.visible_candidate_meshes = len(candidates)
+
+        source_data = []
+        if not stats.cancelled:
+            _update_progress_window(
+                stats,
+                0,
+                max(len(candidates), 1),
+                "Preparing selected mesh data; {} eligible meshes".format(
+                    len(candidates)
+                ),
+            )
+            source_started_at = time.perf_counter()
+            source_data = [MeshData(shape) for shape in source_shapes]
+            stats.source_preparation_seconds = (
+                time.perf_counter() - source_started_at
+            )
+            _update_progress_window(
+                stats,
+                0,
+                max(len(candidates), 1),
+                "Checking eligible mesh 0 of {}".format(len(candidates)),
+            )
 
         for index, candidate_info in enumerate(candidates, start=1):
+            if stats.cancelled:
+                break
             if _cancel_requested(stats, force=True):
                 break
-            if stats.progress_open:
-                cmds.progressWindow(
-                    edit=True,
-                    progress=index,
-                    status="Checking mesh {} of {}".format(
-                        index, len(candidates)
-                    ),
-                )
-                _pump_ui_events()
+            _update_progress_window(
+                stats,
+                index - 1,
+                max(len(candidates), 1),
+                "Checking eligible mesh {} of {}".format(
+                    index,
+                    len(candidates),
+                ),
+            )
 
             candidate_shape, candidate_transform = candidate_info
 

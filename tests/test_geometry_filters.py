@@ -110,6 +110,47 @@ class GeometryFilterTests(unittest.TestCase):
             {"query": True, "isCancelled": True},
         )
 
+    def test_progress_update_edits_window_and_pumps_events(self):
+        stats = selector.IntersectionStats(3)
+        stats.progress_open = True
+        calls = []
+
+        missing = object()
+        original_progress_window = getattr(
+            selector.cmds,
+            "progressWindow",
+            missing,
+        )
+        original_pump = selector._pump_ui_events
+        selector._pump_ui_events = lambda: calls.append("pumped")
+        selector.cmds.progressWindow = lambda **kwargs: calls.append(kwargs)
+        try:
+            selector._update_progress_window(
+                stats,
+                1,
+                3,
+                "Checking eligible mesh 2 of 3",
+            )
+        finally:
+            selector._pump_ui_events = original_pump
+            if original_progress_window is missing:
+                del selector.cmds.progressWindow
+            else:
+                selector.cmds.progressWindow = original_progress_window
+
+        self.assertEqual(
+            calls,
+            [
+                {
+                    "edit": True,
+                    "progress": 1,
+                    "maxValue": 3,
+                    "status": "Checking eligible mesh 2 of 3",
+                },
+                "pumped",
+            ],
+        )
+
     def test_bounding_boxes_reject_separated_meshes(self):
         left = (0, 0, 0, 1, 1, 1)
         right = (2, 0, 0, 3, 1, 1)
