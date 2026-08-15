@@ -56,9 +56,9 @@ object.
 
 The search opens a floating progress window. Press **Escape** to cancel; any
 intersections found before cancellation are still added to the selection.
-The window shows a separate viewport-visibility scan, then resets to an
-eligible-only geometry phase. Hidden and Isolate Select-excluded meshes do not
-count toward the geometry progress total.
+The tool shows a viewport-visibility progress window, then opens a separate
+eligible-only geometry progress window. Hidden and Isolate Select-excluded
+meshes do not count toward the geometry progress total.
 
 An optional world-space tolerance can be supplied:
 
@@ -85,7 +85,7 @@ maya_intersection_selector.get_last_run_stats()
 The reported values include elapsed time, visibility filtering and source
 preparation time, scene, eligible, and disqualified mesh counts, mesh-pair
 counts, ray and closest-point timings, spatial-index build and query timings
-and savings, and cancellation state.
+and savings, progress-window diagnostics, and cancellation state.
 
 ## Shelf button
 

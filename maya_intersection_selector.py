@@ -270,6 +270,9 @@ class IntersectionStats:
         self.cancelled = False
         self.elapsed_seconds = 0.0
         self.progress_open = False
+        self.progress_windows_opened = 0
+        self.progress_update_attempts = 0
+        self.progress_update_failures = 0
         self._last_cancel_poll = 0.0
         self._started_at = time.perf_counter()
 
@@ -315,6 +318,9 @@ class IntersectionStats:
             "spatial_cells_visited": self.spatial_cells_visited,
             "spatial_edges_avoided": self.spatial_edges_avoided,
             "spatial_vertices_avoided": self.spatial_vertices_avoided,
+            "progress_windows_opened": self.progress_windows_opened,
+            "progress_update_attempts": self.progress_update_attempts,
+            "progress_update_failures": self.progress_update_failures,
             "cancelled": self.cancelled,
             "elapsed_seconds": self.elapsed_seconds,
         }
@@ -552,7 +558,6 @@ def _eligible_mesh_candidates(
             _update_progress_window(
                 stats,
                 index,
-                max(scene_mesh_count + 1, 1),
                 "Filtering viewport visibility: {} of {} scene meshes".format(
                     index,
                     scene_mesh_count,
@@ -679,50 +684,68 @@ def _pump_ui_events() -> None:
 
     if QtCore is not None:
         QtCore.QCoreApplication.processEvents()
-    else:
-        # Yield briefly so Escape can be delivered when Qt bindings are absent.
-        cmds.pause(seconds=0.001)
+    # Maya's command loop also needs to yield for native controls to repaint.
+    cmds.pause(seconds=0.001)
 
 
 def _update_progress_window(
     stats: IntersectionStats,
     progress: int,
-    maximum: int,
     status: str,
 ) -> None:
     """Update and repaint the floating progress window when available."""
 
     if not stats.progress_open:
         return
+    stats.progress_update_attempts += 1
     try:
         cmds.progressWindow(
             edit=True,
             progress=progress,
-            maxValue=maximum,
             status=status,
         )
         _pump_ui_events()
     except RuntimeError:
-        stats.progress_open = False
+        stats.progress_update_failures += 1
 
 
-def _open_progress_window(stats: IntersectionStats, scene_mesh_count: int) -> None:
+def _open_progress_window(
+    stats: IntersectionStats,
+    maximum: int,
+    status: str,
+) -> None:
     """Open the progress window, accepting Maya's None-on-success result."""
 
     try:
         creation_result = cmds.progressWindow(
             title="Select Intersecting Geometry",
-            status="Starting viewport visibility scan...",
+            status=status,
             progress=0,
-            maxValue=max(scene_mesh_count + 1, 1),
+            maxValue=max(maximum, 1),
             isInterruptable=True,
         )
         # Some Maya versions return None after successfully creating the
         # window. Only an explicit False means another window owns it.
         stats.progress_open = creation_result is not False
+        if stats.progress_open:
+            stats.progress_windows_opened += 1
+            _pump_ui_events()
     except RuntimeError:
         # The search can still run if another progress window is open.
         stats.progress_open = False
+
+
+def _close_progress_window(stats: IntersectionStats) -> None:
+    """Close the currently owned progress window, if any."""
+
+    if not stats.progress_open:
+        return
+    try:
+        cmds.progressWindow(endProgress=True)
+    except RuntimeError:
+        pass
+    stats.progress_open = False
+    _pump_ui_events()
 
 
 def _cancel_requested(stats: IntersectionStats, force=False) -> bool:
@@ -971,7 +994,11 @@ def add_intersecting_geometry_to_selection(
     candidates = []
 
     try:
-        _open_progress_window(stats, len(scene_shapes))
+        _open_progress_window(
+            stats,
+            len(scene_shapes) + 1,
+            "Starting viewport visibility scan...",
+        )
 
         visibility_started_at = time.perf_counter()
         visibility = PanelVisibility(panel)
@@ -995,12 +1022,12 @@ def add_intersecting_geometry_to_selection(
         )
         stats.candidate_meshes = len(candidates)
         stats.visible_candidate_meshes = len(candidates)
+        _close_progress_window(stats)
 
         source_data = []
         if not stats.cancelled:
-            _update_progress_window(
+            _open_progress_window(
                 stats,
-                0,
                 max(len(candidates), 1),
                 "Preparing selected mesh data; {} eligible meshes".format(
                     len(candidates)
@@ -1014,7 +1041,6 @@ def add_intersecting_geometry_to_selection(
             _update_progress_window(
                 stats,
                 0,
-                max(len(candidates), 1),
                 "Checking eligible mesh 0 of {}".format(len(candidates)),
             )
 
@@ -1026,7 +1052,6 @@ def add_intersecting_geometry_to_selection(
             _update_progress_window(
                 stats,
                 index - 1,
-                max(len(candidates), 1),
                 "Checking eligible mesh {} of {}".format(
                     index,
                     len(candidates),
@@ -1072,12 +1097,7 @@ def add_intersecting_geometry_to_selection(
         if added_transforms:
             cmds.select(sorted(added_transforms), add=True)
     finally:
-        if stats.progress_open:
-            try:
-                cmds.progressWindow(endProgress=True)
-            except RuntimeError:
-                pass
-        stats.progress_open = False
+        _close_progress_window(stats)
         stats.finish()
 
     message = (

@@ -128,7 +128,6 @@ class GeometryFilterTests(unittest.TestCase):
             selector._update_progress_window(
                 stats,
                 1,
-                3,
                 "Checking eligible mesh 2 of 3",
             )
         finally:
@@ -144,7 +143,6 @@ class GeometryFilterTests(unittest.TestCase):
                 {
                     "edit": True,
                     "progress": 1,
-                    "maxValue": 3,
                     "status": "Checking eligible mesh 2 of 3",
                 },
                 "pumped",
@@ -159,10 +157,13 @@ class GeometryFilterTests(unittest.TestCase):
             "progressWindow",
             missing,
         )
+        original_pump = selector._pump_ui_events
+        selector._pump_ui_events = lambda: None
         selector.cmds.progressWindow = lambda **kwargs: None
         try:
-            selector._open_progress_window(stats, 3)
+            selector._open_progress_window(stats, 3, "Starting scan")
         finally:
+            selector._pump_ui_events = original_pump
             if original_progress_window is missing:
                 del selector.cmds.progressWindow
             else:
