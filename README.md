@@ -80,7 +80,8 @@ maya_intersection_selector.get_last_run_stats()
 ```
 
 The reported values include elapsed time, candidate and mesh-pair counts, ray
-tests, bounding-box rejections, closest-point tests, and cancellation state.
+tests, bounding-box rejections, closest-point tests, spatial-index build time
+and savings, and cancellation state.
 
 ## Shelf button
 
@@ -99,6 +100,13 @@ maya_intersection_selector.add_intersecting_geometry_to_selection()
   that overlap the other mesh's bounding box.
 - Edge endpoints and bounds are built lazily and cached once per mesh during a
   run.
+- Dense meshes queried repeatedly receive a lazy uniform-grid index. Candidate
+  bounding boxes then retrieve nearby edges and vertices without rescanning the
+  entire dense mesh.
+- Small meshes and one-off dense-mesh queries keep the lower-overhead linear
+  path instead of building an index that is unlikely to pay for itself. The
+  default adaptive trigger is a mesh with at least 5,000 edges reaching its
+  second edge query.
 - Very dense scenes may take time because mesh edges and vertices are tested.
 - The utility operates on polygon meshes and ignores intermediate shapes.
 - If the Script Editor has focus, the most recently active visible model panel

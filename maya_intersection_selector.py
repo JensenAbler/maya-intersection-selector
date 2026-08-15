@@ -6,6 +6,7 @@ The implementation uses Maya Python API 2.0 and does not modify geometry.
 
 from __future__ import annotations
 
+import math
 import time
 
 import maya.api.OpenMaya as om
@@ -13,6 +14,12 @@ import maya.cmds as cmds
 
 
 DEFAULT_TOLERANCE = 1e-5
+SPATIAL_INDEX_EDGE_THRESHOLD = 5000
+SPATIAL_INDEX_QUERY_THRESHOLD = 2
+SPATIAL_INDEX_TARGET_EDGES_PER_CELL = 32
+SPATIAL_INDEX_MAX_DIVISIONS = 64
+SPATIAL_INDEX_MAX_CELLS_PER_EDGE = 512
+SPATIAL_INDEX_FULL_SCAN_RATIO = 0.65
 LAST_RUN_STATS = None
 
 
@@ -39,6 +46,165 @@ class EdgeData:
         )
 
 
+class UniformMeshIndex:
+    """Uniform grid for querying mesh edges and vertices by world-space box."""
+
+    def __init__(
+        self,
+        mesh,
+        target_edges_per_cell=SPATIAL_INDEX_TARGET_EDGES_PER_CELL,
+        max_divisions=SPATIAL_INDEX_MAX_DIVISIONS,
+    ) -> None:
+        self.bbox = mesh.bbox
+        self.extents = (
+            max(self.bbox[3] - self.bbox[0], 0.0),
+            max(self.bbox[4] - self.bbox[1], 0.0),
+            max(self.bbox[5] - self.bbox[2], 0.0),
+        )
+        edge_count = max(len(mesh.edges), 1)
+        target_cells = max(
+            1,
+            math.ceil(edge_count / float(target_edges_per_cell)),
+        )
+        largest_extent = max(self.extents)
+
+        if largest_extent <= 1e-12:
+            self.divisions = (1, 1, 1)
+        else:
+            active_axes = [
+                axis
+                for axis, extent in enumerate(self.extents)
+                if extent > largest_extent * 1e-6
+            ]
+            active_measure = 1.0
+            for axis in active_axes:
+                active_measure *= self.extents[axis]
+            target_cell_size = (
+                active_measure / float(target_cells)
+            ) ** (1.0 / len(active_axes))
+            divisions = [1, 1, 1]
+            for axis in active_axes:
+                divisions[axis] = max(
+                    1,
+                    min(
+                        max_divisions,
+                        math.ceil(self.extents[axis] / target_cell_size),
+                    ),
+                )
+            self.divisions = tuple(divisions)
+
+        self.cell_sizes = tuple(
+            extent / divisions if divisions > 1 else max(extent, 1.0)
+            for extent, divisions in zip(self.extents, self.divisions)
+        )
+        self.total_cells = (
+            self.divisions[0] * self.divisions[1] * self.divisions[2]
+        )
+        self.edge_cells = {}
+        self.vertex_cells = None
+        self.points = mesh.points
+        self.global_edge_indices = []
+
+        for edge_index, edge in enumerate(mesh.edges):
+            cell_range = self._cell_range(edge.bbox, 0.0)
+            if cell_range is None:
+                continue
+            if self._cell_count(cell_range) > SPATIAL_INDEX_MAX_CELLS_PER_EDGE:
+                self.global_edge_indices.append(edge_index)
+                continue
+            for cell in self._iter_cells(cell_range):
+                self.edge_cells.setdefault(cell, []).append(edge_index)
+
+    def _axis_index(self, value, axis: int) -> int:
+        divisions = self.divisions[axis]
+        if divisions == 1:
+            return 0
+        offset = value - self.bbox[axis]
+        index = int(offset / self.cell_sizes[axis])
+        return max(0, min(divisions - 1, index))
+
+    def _cell_range(self, bbox, padding: float):
+        expanded = (
+            bbox[0] - padding,
+            bbox[1] - padding,
+            bbox[2] - padding,
+            bbox[3] + padding,
+            bbox[4] + padding,
+            bbox[5] + padding,
+        )
+        if not _bounding_boxes_overlap(self.bbox, expanded, 0.0):
+            return None
+
+        return (
+            self._axis_index(max(expanded[0], self.bbox[0]), 0),
+            self._axis_index(max(expanded[1], self.bbox[1]), 1),
+            self._axis_index(max(expanded[2], self.bbox[2]), 2),
+            self._axis_index(min(expanded[3], self.bbox[3]), 0),
+            self._axis_index(min(expanded[4], self.bbox[4]), 1),
+            self._axis_index(min(expanded[5], self.bbox[5]), 2),
+        )
+
+    @staticmethod
+    def _cell_count(cell_range) -> int:
+        return (
+            (cell_range[3] - cell_range[0] + 1)
+            * (cell_range[4] - cell_range[1] + 1)
+            * (cell_range[5] - cell_range[2] + 1)
+        )
+
+    @staticmethod
+    def _iter_cells(cell_range):
+        for x_index in range(cell_range[0], cell_range[3] + 1):
+            for y_index in range(cell_range[1], cell_range[4] + 1):
+                for z_index in range(cell_range[2], cell_range[5] + 1):
+                    yield x_index, y_index, z_index
+
+    def _point_cell(self, point):
+        return (
+            self._axis_index(point.x, 0),
+            self._axis_index(point.y, 1),
+            self._axis_index(point.z, 2),
+        )
+
+    def edge_indices(self, bbox, padding: float):
+        """Return candidate edge indices, or None when a full scan is cheaper."""
+
+        cell_range = self._cell_range(bbox, padding)
+        if cell_range is None:
+            return (), 0
+
+        visited_cells = self._cell_count(cell_range)
+        if visited_cells >= self.total_cells * SPATIAL_INDEX_FULL_SCAN_RATIO:
+            return None, visited_cells
+
+        edge_indices = set(self.global_edge_indices)
+        for cell in self._iter_cells(cell_range):
+            edge_indices.update(self.edge_cells.get(cell, ()))
+        return tuple(edge_indices), visited_cells
+
+    def vertex_indices(self, bbox, padding: float):
+        """Return candidate vertex indices, or None when a full scan is cheaper."""
+
+        if self.vertex_cells is None:
+            self.vertex_cells = {}
+            for vertex_index, point in enumerate(self.points):
+                cell = self._point_cell(point)
+                self.vertex_cells.setdefault(cell, []).append(vertex_index)
+
+        cell_range = self._cell_range(bbox, padding)
+        if cell_range is None:
+            return (), 0
+
+        visited_cells = self._cell_count(cell_range)
+        if visited_cells >= self.total_cells * SPATIAL_INDEX_FULL_SCAN_RATIO:
+            return None, visited_cells
+
+        vertex_indices = []
+        for cell in self._iter_cells(cell_range):
+            vertex_indices.extend(self.vertex_cells.get(cell, ()))
+        return tuple(vertex_indices), visited_cells
+
+
 class IntersectionStats:
     """Counters from the most recent selector run."""
 
@@ -56,6 +222,13 @@ class IntersectionStats:
         self.closest_point_tests = 0
         self.containment_tests = 0
         self.containment_rays = 0
+        self.spatial_indexes_built = 0
+        self.spatial_index_build_seconds = 0.0
+        self.spatial_edge_queries = 0
+        self.spatial_vertex_queries = 0
+        self.spatial_cells_visited = 0
+        self.spatial_edges_avoided = 0
+        self.spatial_vertices_avoided = 0
         self.cancelled = False
         self.elapsed_seconds = 0.0
         self.progress_open = False
@@ -81,6 +254,13 @@ class IntersectionStats:
             "closest_point_tests": self.closest_point_tests,
             "containment_tests": self.containment_tests,
             "containment_rays": self.containment_rays,
+            "spatial_indexes_built": self.spatial_indexes_built,
+            "spatial_index_build_seconds": self.spatial_index_build_seconds,
+            "spatial_edge_queries": self.spatial_edge_queries,
+            "spatial_vertex_queries": self.spatial_vertex_queries,
+            "spatial_cells_visited": self.spatial_cells_visited,
+            "spatial_edges_avoided": self.spatial_edges_avoided,
+            "spatial_vertices_avoided": self.spatial_vertices_avoided,
             "cancelled": self.cancelled,
             "elapsed_seconds": self.elapsed_seconds,
         }
@@ -103,6 +283,8 @@ class MeshData:
         self.accel = self.mesh_fn.autoUniformGridParams()
         self.bbox = bbox or cmds.exactWorldBoundingBox(shape)
         self._edges = None
+        self._spatial_index = None
+        self._spatial_edge_queries = 0
 
     @property
     def edges(self):
@@ -116,6 +298,55 @@ class MeshData:
                     EdgeData(self.points[vertex_a], self.points[vertex_b])
                 )
         return self._edges
+
+    def _ensure_spatial_index(self, stats: IntersectionStats):
+        if self._spatial_index is None:
+            started_at = time.perf_counter()
+            self._spatial_index = UniformMeshIndex(self)
+            stats.spatial_indexes_built += 1
+            stats.spatial_index_build_seconds += time.perf_counter() - started_at
+        return self._spatial_index
+
+    def edge_indices_for_bbox(self, bbox, padding: float, stats: IntersectionStats):
+        """Return indexed edge candidates when repeated dense queries justify it."""
+
+        self._spatial_edge_queries += 1
+        if self.mesh_fn.numEdges < SPATIAL_INDEX_EDGE_THRESHOLD:
+            return None
+        if self._spatial_edge_queries < SPATIAL_INDEX_QUERY_THRESHOLD:
+            return None
+
+        spatial_index = self._ensure_spatial_index(stats)
+        edge_indices, visited_cells = spatial_index.edge_indices(bbox, padding)
+        stats.spatial_edge_queries += 1
+        stats.spatial_cells_visited += visited_cells
+        if edge_indices is not None:
+            stats.spatial_edges_avoided += self.mesh_fn.numEdges - len(edge_indices)
+        return edge_indices
+
+    def vertex_indices_for_bbox(
+        self,
+        bbox,
+        padding: float,
+        stats: IntersectionStats,
+    ):
+        """Reuse an existing edge index for closest-point candidate vertices."""
+
+        if self._spatial_index is None:
+            return None
+
+        vertex_index_was_unbuilt = self._spatial_index.vertex_cells is None
+        started_at = time.perf_counter()
+        vertex_indices, visited_cells = self._spatial_index.vertex_indices(
+            bbox, padding
+        )
+        if vertex_index_was_unbuilt:
+            stats.spatial_index_build_seconds += time.perf_counter() - started_at
+        stats.spatial_vertex_queries += 1
+        stats.spatial_cells_visited += visited_cells
+        if vertex_indices is not None:
+            stats.spatial_vertices_avoided += len(self.points) - len(vertex_indices)
+        return vertex_indices
 
 
 class PanelVisibility:
@@ -300,8 +531,15 @@ def _edges_hit_mesh(
     """Cast every source edge as a finite ray against the target mesh."""
 
     bbox_padding = _ray_bbox_padding(target.bbox, tolerance)
+    edge_indices = source.edge_indices_for_bbox(
+        target.bbox, bbox_padding, stats
+    )
+    if edge_indices is None:
+        edges = source.edges
+    else:
+        edges = (source.edges[index] for index in edge_indices)
 
-    for edge in source.edges:
+    for edge in edges:
         stats.edges_considered += 1
         if stats.edges_considered % 256 == 0 and _cancel_requested(stats):
             return False
@@ -379,7 +617,15 @@ def _vertices_touch_mesh(
 ) -> bool:
     """Check only source vertices that can reach the target bounding box."""
 
-    for point in source.points:
+    vertex_indices = source.vertex_indices_for_bbox(
+        target.bbox, tolerance, stats
+    )
+    if vertex_indices is None:
+        points = source.points
+    else:
+        points = (source.points[index] for index in vertex_indices)
+
+    for point in points:
         stats.vertices_considered += 1
         if stats.vertices_considered % 256 == 0 and _cancel_requested(stats):
             return False
@@ -575,7 +821,7 @@ def add_intersecting_geometry_to_selection(
     message = (
         "{}Added {} intersecting object(s) in {:.2f}s; "
         "{} ray test(s), {} edge-box rejection(s), "
-        "{} closest-point test(s)."
+        "{} closest-point test(s), {} indexed edge(s) avoided."
     ).format(
         "Cancelled. " if stats.cancelled else "",
         len(added_transforms),
@@ -583,6 +829,7 @@ def add_intersecting_geometry_to_selection(
         stats.ray_tests,
         stats.edge_bbox_rejections,
         stats.closest_point_tests,
+        stats.spatial_edges_avoided,
     )
     if stats.cancelled:
         om.MGlobal.displayWarning(message)
