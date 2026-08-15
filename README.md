@@ -54,6 +54,9 @@ Candidates must also be visible in the active model panel. The filter honors:
 eligible when it is outside the camera frame or visually occluded by another
 object.
 
+The search opens a progress window. Press **Escape** to cancel; any intersections
+found before cancellation are still added to the selection.
+
 An optional world-space tolerance can be supplied:
 
 ```python
@@ -70,6 +73,15 @@ maya_intersection_selector.add_intersecting_geometry_to_selection(
 )
 ```
 
+The last run's performance counters are available for profiling or bug reports:
+
+```python
+maya_intersection_selector.get_last_run_stats()
+```
+
+The reported values include elapsed time, candidate and mesh-pair counts, ray
+tests, bounding-box rejections, closest-point tests, and cancellation state.
+
 ## Shelf button
 
 Create a Python shelf button containing:
@@ -83,6 +95,10 @@ maya_intersection_selector.add_intersecting_geometry_to_selection()
 
 - Complete-containment detection assumes closed, reasonably manifold geometry.
 - Detailed testing begins only after a fast bounding-box check.
+- Edge rays and closest-point queries are restricted to portions of each mesh
+  that overlap the other mesh's bounding box.
+- Edge endpoints and bounds are built lazily and cached once per mesh during a
+  run.
 - Very dense scenes may take time because mesh edges and vertices are tested.
 - The utility operates on polygon meshes and ignores intermediate shapes.
 - If the Script Editor has focus, the most recently active visible model panel
