@@ -54,8 +54,10 @@ Candidates must also be visible in the active model panel. The filter honors:
 eligible when it is outside the camera frame or visually occluded by another
 object.
 
-The search opens a progress window. Press **Escape** to cancel; any intersections
-found before cancellation are still added to the selection.
+The search uses Maya's main progress bar. Press **Escape** to cancel; any
+intersections found before cancellation are still added to the selection.
+Hidden and Isolate Select-excluded meshes are filtered first, so they do not
+count toward the progress total.
 
 An optional world-space tolerance can be supplied:
 
@@ -79,9 +81,9 @@ The last run's performance counters are available for profiling or bug reports:
 maya_intersection_selector.get_last_run_stats()
 ```
 
-The reported values include elapsed time, candidate and mesh-pair counts, ray
-tests, bounding-box rejections, closest-point tests, spatial-index build time
-and savings, and cancellation state.
+The reported values include elapsed time, scene, eligible, and disqualified
+mesh counts, mesh-pair counts, ray and closest-point timings, spatial-index
+build and query timings and savings, and cancellation state.
 
 ## Shelf button
 
@@ -97,12 +99,15 @@ maya_intersection_selector.add_intersecting_geometry_to_selection()
 - Complete-containment detection assumes closed, reasonably manifold geometry.
 - Detailed testing begins only after a fast bounding-box check.
 - Edge rays and closest-point queries are restricted to portions of each mesh
-  that overlap the other mesh's bounding box.
+  that can overlap the other mesh.
 - Edge endpoints and bounds are built lazily and cached once per mesh during a
   run.
-- Dense meshes queried repeatedly receive a lazy uniform-grid index. Candidate
-  bounding boxes then retrieve nearby edges and vertices without rescanning the
-  entire dense mesh.
+- Dense meshes queried repeatedly receive a lazy uniform-grid index. Target
+  triangle bounds retrieve source edges near the target surface, while target
+  bounds retrieve nearby vertices, without rescanning the entire dense mesh.
+- Repeated closest-point tests use a lazily built mesh octree, with an automatic
+  fallback to Maya's regular closest-point query if the intersector is
+  unavailable.
 - Small meshes and one-off dense-mesh queries keep the lower-overhead linear
   path instead of building an index that is unlikely to pay for itself. The
   default adaptive trigger is a mesh with at least 5,000 edges reaching its

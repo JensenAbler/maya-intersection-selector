@@ -11,6 +11,15 @@ import time
 
 import maya.api.OpenMaya as om
 import maya.cmds as cmds
+import maya.mel as mel
+
+try:
+    from PySide6 import QtCore
+except ImportError:
+    try:
+        from PySide2 import QtCore
+    except ImportError:
+        QtCore = None
 
 
 DEFAULT_TOLERANCE = 1e-5
@@ -182,6 +191,23 @@ class UniformMeshIndex:
             edge_indices.update(self.edge_cells.get(cell, ()))
         return tuple(edge_indices), visited_cells
 
+    def edge_indices_for_bboxes(self, bboxes, padding: float):
+        """Return edges near a collection of surface-element bounding boxes."""
+
+        cells = set()
+        for bbox in bboxes:
+            cell_range = self._cell_range(bbox, padding)
+            if cell_range is None:
+                continue
+            cells.update(self._iter_cells(cell_range))
+            if len(cells) >= self.total_cells * SPATIAL_INDEX_FULL_SCAN_RATIO:
+                return None, len(cells)
+
+        edge_indices = set(self.global_edge_indices)
+        for cell in cells:
+            edge_indices.update(self.edge_cells.get(cell, ()))
+        return tuple(edge_indices), len(cells)
+
     def vertex_indices(self, bbox, padding: float):
         """Return candidate vertex indices, or None when a full scan is cheaper."""
 
@@ -208,8 +234,10 @@ class UniformMeshIndex:
 class IntersectionStats:
     """Counters from the most recent selector run."""
 
-    def __init__(self, candidate_meshes: int) -> None:
-        self.candidate_meshes = candidate_meshes
+    def __init__(self, scene_meshes: int) -> None:
+        self.scene_meshes = scene_meshes
+        self.candidate_meshes = 0
+        self.visibility_disqualified_meshes = 0
         self.visible_candidate_meshes = 0
         self.broad_phase_rejections = 0
         self.mesh_pairs_tested = 0
@@ -220,11 +248,20 @@ class IntersectionStats:
         self.vertices_considered = 0
         self.vertex_bbox_rejections = 0
         self.closest_point_tests = 0
+        self.closest_point_seconds = 0.0
+        self.closest_intersectors_built = 0
+        self.closest_intersector_failures = 0
+        self.closest_intersector_build_seconds = 0.0
         self.containment_tests = 0
         self.containment_rays = 0
+        self.containment_ray_seconds = 0.0
+        self.ray_test_seconds = 0.0
         self.spatial_indexes_built = 0
         self.spatial_index_build_seconds = 0.0
+        self.spatial_query_seconds = 0.0
         self.spatial_edge_queries = 0
+        self.spatial_surface_queries = 0
+        self.spatial_surface_boxes = 0
         self.spatial_vertex_queries = 0
         self.spatial_cells_visited = 0
         self.spatial_edges_avoided = 0
@@ -232,6 +269,8 @@ class IntersectionStats:
         self.cancelled = False
         self.elapsed_seconds = 0.0
         self.progress_open = False
+        self.progress_control = None
+        self._last_cancel_poll = 0.0
         self._started_at = time.perf_counter()
 
     def finish(self) -> None:
@@ -241,7 +280,9 @@ class IntersectionStats:
         """Return stable, copy-safe profiling data for callers and bug reports."""
 
         return {
+            "scene_meshes": self.scene_meshes,
             "candidate_meshes": self.candidate_meshes,
+            "visibility_disqualified_meshes": self.visibility_disqualified_meshes,
             "visible_candidate_meshes": self.visible_candidate_meshes,
             "broad_phase_rejections": self.broad_phase_rejections,
             "mesh_pairs_tested": self.mesh_pairs_tested,
@@ -252,11 +293,22 @@ class IntersectionStats:
             "vertices_considered": self.vertices_considered,
             "vertex_bbox_rejections": self.vertex_bbox_rejections,
             "closest_point_tests": self.closest_point_tests,
+            "closest_point_seconds": self.closest_point_seconds,
+            "closest_intersectors_built": self.closest_intersectors_built,
+            "closest_intersector_failures": self.closest_intersector_failures,
+            "closest_intersector_build_seconds": (
+                self.closest_intersector_build_seconds
+            ),
             "containment_tests": self.containment_tests,
             "containment_rays": self.containment_rays,
+            "containment_ray_seconds": self.containment_ray_seconds,
+            "ray_test_seconds": self.ray_test_seconds,
             "spatial_indexes_built": self.spatial_indexes_built,
             "spatial_index_build_seconds": self.spatial_index_build_seconds,
+            "spatial_query_seconds": self.spatial_query_seconds,
             "spatial_edge_queries": self.spatial_edge_queries,
+            "spatial_surface_queries": self.spatial_surface_queries,
+            "spatial_surface_boxes": self.spatial_surface_boxes,
             "spatial_vertex_queries": self.spatial_vertex_queries,
             "spatial_cells_visited": self.spatial_cells_visited,
             "spatial_edges_avoided": self.spatial_edges_avoided,
@@ -283,8 +335,12 @@ class MeshData:
         self.accel = self.mesh_fn.autoUniformGridParams()
         self.bbox = bbox or cmds.exactWorldBoundingBox(shape)
         self._edges = None
+        self._triangle_bboxes = None
         self._spatial_index = None
         self._spatial_edge_queries = 0
+        self._closest_intersector = None
+        self._closest_intersector_failed = False
+        self._object_to_world = self.dag_path.inclusiveMatrix()
 
     @property
     def edges(self):
@@ -299,6 +355,29 @@ class MeshData:
                 )
         return self._edges
 
+    @property
+    def triangle_bboxes(self):
+        """Build cached world-space triangle bounds for surface-aware queries."""
+
+        if self._triangle_bboxes is None:
+            _, triangle_vertices = self.mesh_fn.getTriangles()
+            self._triangle_bboxes = []
+            for offset in range(0, len(triangle_vertices), 3):
+                point_a = self.points[triangle_vertices[offset]]
+                point_b = self.points[triangle_vertices[offset + 1]]
+                point_c = self.points[triangle_vertices[offset + 2]]
+                self._triangle_bboxes.append(
+                    (
+                        min(point_a.x, point_b.x, point_c.x),
+                        min(point_a.y, point_b.y, point_c.y),
+                        min(point_a.z, point_b.z, point_c.z),
+                        max(point_a.x, point_b.x, point_c.x),
+                        max(point_a.y, point_b.y, point_c.y),
+                        max(point_a.z, point_b.z, point_c.z),
+                    )
+                )
+        return self._triangle_bboxes
+
     def _ensure_spatial_index(self, stats: IntersectionStats):
         if self._spatial_index is None:
             started_at = time.perf_counter()
@@ -307,8 +386,8 @@ class MeshData:
             stats.spatial_index_build_seconds += time.perf_counter() - started_at
         return self._spatial_index
 
-    def edge_indices_for_bbox(self, bbox, padding: float, stats: IntersectionStats):
-        """Return indexed edge candidates when repeated dense queries justify it."""
+    def edge_indices_for_mesh(self, target, padding: float, stats: IntersectionStats):
+        """Return dense-source edges near the target's triangulated surface."""
 
         self._spatial_edge_queries += 1
         if self.mesh_fn.numEdges < SPATIAL_INDEX_EDGE_THRESHOLD:
@@ -317,9 +396,16 @@ class MeshData:
             return None
 
         spatial_index = self._ensure_spatial_index(stats)
-        edge_indices, visited_cells = spatial_index.edge_indices(bbox, padding)
+        started_at = time.perf_counter()
+        edge_indices, visited_cells = spatial_index.edge_indices_for_bboxes(
+            target.triangle_bboxes,
+            padding,
+        )
         stats.spatial_edge_queries += 1
+        stats.spatial_surface_queries += 1
+        stats.spatial_surface_boxes += len(target.triangle_bboxes)
         stats.spatial_cells_visited += visited_cells
+        stats.spatial_query_seconds += time.perf_counter() - started_at
         if edge_indices is not None:
             stats.spatial_edges_avoided += self.mesh_fn.numEdges - len(edge_indices)
         return edge_indices
@@ -347,6 +433,45 @@ class MeshData:
         if vertex_indices is not None:
             stats.spatial_vertices_avoided += len(self.points) - len(vertex_indices)
         return vertex_indices
+
+    def closest_point_distance(self, point, stats: IntersectionStats) -> float:
+        """Use a cached octree closest-point query with an exact world distance."""
+
+        started_at = time.perf_counter()
+        if not self._closest_intersector_failed:
+            try:
+                if self._closest_intersector is None:
+                    build_started_at = time.perf_counter()
+                    self._closest_intersector = om.MMeshIntersector()
+                    self._closest_intersector.create(
+                        self.dag_path.node(),
+                        self.dag_path.inclusiveMatrixInverse(),
+                    )
+                    stats.closest_intersectors_built += 1
+                    stats.closest_intersector_build_seconds += (
+                        time.perf_counter() - build_started_at
+                    )
+
+                point_on_mesh = self._closest_intersector.getClosestPoint(point)
+                if point_on_mesh is not None:
+                    object_point = point_on_mesh.point
+                    closest_world = om.MPoint(
+                        object_point.x,
+                        object_point.y,
+                        object_point.z,
+                    ) * self._object_to_world
+                    stats.closest_point_seconds += time.perf_counter() - started_at
+                    return point.distanceTo(closest_world)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                self._closest_intersector_failed = True
+                stats.closest_intersector_failures += 1
+
+        closest_point, _ = self.mesh_fn.getClosestPoint(
+            point,
+            om.MSpace.kWorld,
+        )
+        stats.closest_point_seconds += time.perf_counter() - started_at
+        return point.distanceTo(closest_point)
 
 
 class PanelVisibility:
@@ -405,6 +530,34 @@ def _selected_mesh_shapes() -> list[str]:
         shapes.update(descendants)
 
     return sorted(shapes)
+
+
+def _eligible_mesh_candidates(
+    scene_shapes,
+    source_transforms,
+    visibility: PanelVisibility,
+):
+    """Resolve visible, non-source candidates before geometric processing."""
+
+    candidates = []
+    disqualified_count = 0
+    for candidate_shape in scene_shapes:
+        candidate_transform = (
+            cmds.listRelatives(
+                candidate_shape,
+                parent=True,
+                fullPath=True,
+            )
+            or [candidate_shape]
+        )[0]
+        if candidate_transform in source_transforms:
+            continue
+        if not visibility.includes(candidate_shape):
+            disqualified_count += 1
+            continue
+        candidates.append((candidate_shape, candidate_transform))
+
+    return candidates, disqualified_count
 
 
 def _active_model_panel() -> str | None:
@@ -502,24 +655,49 @@ def _ray_bbox_padding(bbox, tolerance: float) -> float:
     return tolerance * max(diagonal, 1.0)
 
 
-def _cancel_requested(stats: IntersectionStats) -> bool:
-    """Poll Maya's progress window without making every loop iteration a UI call."""
+def _pump_ui_events() -> None:
+    """Allow Maya to receive keyboard input during synchronous API loops."""
+
+    if QtCore is not None:
+        QtCore.QCoreApplication.processEvents()
+    else:
+        # Yield briefly so Escape can be delivered when Qt bindings are absent.
+        cmds.pause(seconds=0.001)
+
+
+def _cancel_requested(stats: IntersectionStats, force=False) -> bool:
+    """Pump UI events and poll cancellation at a bounded frequency."""
 
     if stats.cancelled:
         return True
     if not stats.progress_open:
         return False
 
+    now = time.perf_counter()
+    if not force and now - stats._last_cancel_poll < 0.05:
+        return False
+    stats._last_cancel_poll = now
+
     try:
-        stats.cancelled = cmds.progressWindow(query=True, isCancelled=True)
+        _pump_ui_events()
+        stats.cancelled = cmds.progressBar(
+            stats.progress_control,
+            query=True,
+            isCancelled=True,
+        )
     except RuntimeError:
         stats.progress_open = False
     return stats.cancelled
 
 
-def _point_touches_mesh(point, target: MeshData, tolerance: float) -> bool:
-    closest_point, _ = target.mesh_fn.getClosestPoint(point, om.MSpace.kWorld)
-    return point.distanceTo(closest_point) <= tolerance
+def _point_touches_mesh(
+    point,
+    target: MeshData,
+    tolerance: float,
+    stats: IntersectionStats,
+) -> bool:
+    stats.closest_point_tests += 1
+    return target.closest_point_distance(point, stats) <= tolerance
 
 
 def _edges_hit_mesh(
@@ -531,8 +709,8 @@ def _edges_hit_mesh(
     """Cast every source edge as a finite ray against the target mesh."""
 
     bbox_padding = _ray_bbox_padding(target.bbox, tolerance)
-    edge_indices = source.edge_indices_for_bbox(
-        target.bbox, bbox_padding, stats
+    edge_indices = source.edge_indices_for_mesh(
+        target, bbox_padding, stats
     )
     if edge_indices is None:
         edges = source.edges
@@ -553,6 +731,7 @@ def _edges_hit_mesh(
             continue
 
         stats.ray_tests += 1
+        started_at = time.perf_counter()
         hit = target.mesh_fn.anyIntersection(
             edge.ray_source,
             edge.direction,
@@ -562,6 +741,7 @@ def _edges_hit_mesh(
             accelParams=target.accel,
             tolerance=tolerance,
         )
+        stats.ray_test_seconds += time.perf_counter() - started_at
         if hit:
             return True
 
@@ -580,8 +760,7 @@ def _point_inside_mesh(
     if not _point_in_bounding_box(point, target.bbox, tolerance):
         return False
 
-    stats.closest_point_tests += 1
-    if _point_touches_mesh(point, target, tolerance):
+    if _point_touches_mesh(point, target, tolerance, stats):
         return True
 
     ray_source = om.MFloatPoint(point.x, point.y, point.z)
@@ -589,6 +768,7 @@ def _point_inside_mesh(
     ray_direction.normalize()
 
     stats.containment_rays += 1
+    started_at = time.perf_counter()
     hits = target.mesh_fn.allIntersections(
         ray_source,
         ray_direction,
@@ -598,6 +778,7 @@ def _point_inside_mesh(
         accelParams=target.accel,
         tolerance=tolerance,
     )
+    stats.containment_ray_seconds += time.perf_counter() - started_at
     if not hits:
         return False
 
@@ -633,8 +814,7 @@ def _vertices_touch_mesh(
             stats.vertex_bbox_rejections += 1
             continue
 
-        stats.closest_point_tests += 1
-        if _point_touches_mesh(point, target, tolerance):
+        if _point_touches_mesh(point, target, tolerance, stats):
             return True
 
     return False
@@ -730,52 +910,64 @@ def add_intersecting_geometry_to_selection(
     stats = IntersectionStats(len(scene_shapes))
     LAST_RUN_STATS = stats
     visibility = PanelVisibility(panel)
+    source_transforms = {
+        (
+            cmds.listRelatives(shape, parent=True, fullPath=True)
+            or [shape]
+        )[0]
+        for shape in source_shapes
+    }
+    # Resolve visibility before opening the progress bar so its denominator
+    # describes only meshes eligible for geometric processing.
+    candidates, stats.visibility_disqualified_meshes = (
+        _eligible_mesh_candidates(
+            scene_shapes,
+            source_transforms,
+            visibility,
+        )
+    )
+
+    stats.candidate_meshes = len(candidates)
+    stats.visible_candidate_meshes = len(candidates)
 
     try:
         try:
-            cmds.progressWindow(
-                title="Select Intersecting Geometry",
-                status="Preparing mesh candidates...",
+            stats.progress_control = mel.eval("$tmp = $gMainProgressBar")
+            cmds.progressBar(
+                stats.progress_control,
+                edit=True,
+                beginProgress=True,
+                status="Preparing visible mesh candidates...",
                 progress=0,
-                maxValue=max(len(scene_shapes), 1),
+                maxValue=max(len(candidates), 1),
                 isInterruptable=True,
             )
             stats.progress_open = True
         except RuntimeError:
-            # Maya allows only one progress window at a time. The search can
-            # still run if another tool already owns it.
+            # The search can still run if Maya's main progress bar is busy.
             pass
 
         source_data = [MeshData(shape) for shape in source_shapes]
-        source_transforms = {mesh.transform for mesh in source_data}
 
-        for index, candidate_shape in enumerate(scene_shapes, start=1):
-            if _cancel_requested(stats):
+        for index, candidate_info in enumerate(candidates, start=1):
+            if _cancel_requested(stats, force=True):
                 break
             if stats.progress_open:
-                cmds.progressWindow(
+                cmds.progressBar(
+                    stats.progress_control,
                     edit=True,
                     progress=index,
                     status="Checking mesh {} of {}".format(
-                        index, len(scene_shapes)
+                        index, len(candidates)
                     ),
                 )
+                _pump_ui_events()
 
-            candidate_transform = (
-                cmds.listRelatives(
-                    candidate_shape, parent=True, fullPath=True
-                )
-                or [candidate_shape]
-            )[0]
+            candidate_shape, candidate_transform = candidate_info
 
-            if candidate_transform in source_transforms:
-                continue
             if candidate_transform in added_transforms:
                 continue
-            if not visibility.includes(candidate_shape):
-                continue
 
-            stats.visible_candidate_meshes += 1
             candidate_bbox = cmds.exactWorldBoundingBox(candidate_shape)
             overlapping_sources = [
                 source
@@ -812,7 +1004,11 @@ def add_intersecting_geometry_to_selection(
     finally:
         if stats.progress_open:
             try:
-                cmds.progressWindow(endProgress=True)
+                cmds.progressBar(
+                    stats.progress_control,
+                    edit=True,
+                    endProgress=True,
+                )
             except RuntimeError:
                 pass
         stats.progress_open = False

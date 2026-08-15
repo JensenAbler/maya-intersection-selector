@@ -11,14 +11,17 @@ maya = types.ModuleType("maya")
 maya_api = types.ModuleType("maya.api")
 open_maya = types.ModuleType("maya.api.OpenMaya")
 maya_cmds = types.ModuleType("maya.cmds")
+maya_mel = types.ModuleType("maya.mel")
 maya.api = maya_api
 maya.cmds = maya_cmds
+maya.mel = maya_mel
 maya_api.OpenMaya = open_maya
 
 sys.modules.setdefault("maya", maya)
 sys.modules.setdefault("maya.api", maya_api)
 sys.modules.setdefault("maya.api.OpenMaya", open_maya)
 sys.modules.setdefault("maya.cmds", maya_cmds)
+sys.modules.setdefault("maya.mel", maya_mel)
 
 selector = importlib.import_module("maya_intersection_selector")
 
@@ -46,6 +49,68 @@ class IndexedMesh:
 
 
 class GeometryFilterTests(unittest.TestCase):
+    def test_candidate_prefilter_excludes_sources_and_invisible_meshes(self):
+        class Visibility:
+            @staticmethod
+            def includes(shape):
+                return shape == "visibleShape"
+
+        missing = object()
+        original_list_relatives = getattr(
+            selector.cmds,
+            "listRelatives",
+            missing,
+        )
+        selector.cmds.listRelatives = lambda shape, **kwargs: [
+            "|{}Transform".format(shape)
+        ]
+        try:
+            candidates, disqualified = selector._eligible_mesh_candidates(
+                ["sourceShape", "hiddenShape", "visibleShape"],
+                {"|sourceShapeTransform"},
+                Visibility(),
+            )
+        finally:
+            if original_list_relatives is missing:
+                del selector.cmds.listRelatives
+            else:
+                selector.cmds.listRelatives = original_list_relatives
+
+        self.assertEqual(
+            candidates,
+            [("visibleShape", "|visibleShapeTransform")],
+        )
+        self.assertEqual(disqualified, 1)
+
+    def test_cancel_poll_pumps_events_and_reads_main_progress_bar(self):
+        stats = selector.IntersectionStats(1)
+        stats.progress_open = True
+        stats.progress_control = "mainProgressBar"
+        calls = []
+
+        missing = object()
+        original_progress_bar = getattr(selector.cmds, "progressBar", missing)
+        original_pump = selector._pump_ui_events
+        selector._pump_ui_events = lambda: calls.append("pumped")
+        selector.cmds.progressBar = lambda control, **kwargs: (
+            calls.append((control, kwargs)) or True
+        )
+        try:
+            self.assertTrue(selector._cancel_requested(stats, force=True))
+        finally:
+            selector._pump_ui_events = original_pump
+            if original_progress_bar is missing:
+                del selector.cmds.progressBar
+            else:
+                selector.cmds.progressBar = original_progress_bar
+
+        self.assertEqual(calls[0], "pumped")
+        self.assertEqual(calls[1][0], "mainProgressBar")
+        self.assertEqual(
+            calls[1][1],
+            {"query": True, "isCancelled": True},
+        )
+
     def test_bounding_boxes_reject_separated_meshes(self):
         left = (0, 0, 0, 1, 1, 1)
         right = (2, 0, 0, 3, 1, 1)
@@ -92,6 +157,16 @@ class GeometryFilterTests(unittest.TestCase):
         )
         self.assertIsNone(edge_indices)
 
+    def test_surface_boxes_retrieve_only_nearby_edge_cells(self):
+        spatial_index = selector.UniformMeshIndex(
+            IndexedMesh(), target_edges_per_cell=0.01, max_divisions=10
+        )
+        edge_indices, _ = spatial_index.edge_indices_for_bboxes(
+            [(0, 0, 0, 2, 2, 2)],
+            0.0,
+        )
+        self.assertEqual(edge_indices, (0,))
+
     def test_spatial_index_has_no_bounding_box_false_negatives(self):
         generator = random.Random(731)
         mesh = IndexedMesh()
@@ -136,6 +211,36 @@ class GeometryFilterTests(unittest.TestCase):
                     )
                 }
                 self.assertTrue(expected_edges.issubset(set(edge_indices)))
+
+            surface_boxes = [
+                query_bbox,
+                (
+                    max(0.0, query_bbox[0] - 0.25),
+                    max(0.0, query_bbox[1] - 0.25),
+                    max(0.0, query_bbox[2] - 0.25),
+                    query_bbox[3],
+                    query_bbox[4],
+                    query_bbox[5],
+                ),
+            ]
+            surface_edge_indices, _ = spatial_index.edge_indices_for_bboxes(
+                surface_boxes,
+                padding,
+            )
+            if surface_edge_indices is not None:
+                expected_surface_edges = {
+                    index
+                    for index, edge in enumerate(mesh.edges)
+                    if any(
+                        selector._bounding_boxes_overlap(
+                            edge.bbox, surface_bbox, padding
+                        )
+                        for surface_bbox in surface_boxes
+                    )
+                }
+                self.assertTrue(
+                    expected_surface_edges.issubset(set(surface_edge_indices))
+                )
 
             vertex_indices, _ = spatial_index.vertex_indices(query_bbox, padding)
             if vertex_indices is not None:
