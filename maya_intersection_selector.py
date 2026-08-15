@@ -11,7 +11,6 @@ import time
 
 import maya.api.OpenMaya as om
 import maya.cmds as cmds
-import maya.mel as mel
 
 try:
     from PySide6 import QtCore
@@ -269,7 +268,6 @@ class IntersectionStats:
         self.cancelled = False
         self.elapsed_seconds = 0.0
         self.progress_open = False
-        self.progress_control = None
         self._last_cancel_poll = 0.0
         self._started_at = time.perf_counter()
 
@@ -680,8 +678,7 @@ def _cancel_requested(stats: IntersectionStats, force=False) -> bool:
 
     try:
         _pump_ui_events()
-        stats.cancelled = cmds.progressBar(
-            stats.progress_control,
+        stats.cancelled = cmds.progressWindow(
             query=True,
             isCancelled=True,
         )
@@ -932,19 +929,17 @@ def add_intersecting_geometry_to_selection(
 
     try:
         try:
-            stats.progress_control = mel.eval("$tmp = $gMainProgressBar")
-            cmds.progressBar(
-                stats.progress_control,
-                edit=True,
-                beginProgress=True,
-                status="Preparing visible mesh candidates...",
-                progress=0,
-                maxValue=max(len(candidates), 1),
-                isInterruptable=True,
+            stats.progress_open = bool(
+                cmds.progressWindow(
+                    title="Select Intersecting Geometry",
+                    status="Preparing visible mesh candidates...",
+                    progress=0,
+                    maxValue=max(len(candidates), 1),
+                    isInterruptable=True,
+                )
             )
-            stats.progress_open = True
         except RuntimeError:
-            # The search can still run if Maya's main progress bar is busy.
+            # The search can still run if another progress window is open.
             pass
 
         source_data = [MeshData(shape) for shape in source_shapes]
@@ -953,8 +948,7 @@ def add_intersecting_geometry_to_selection(
             if _cancel_requested(stats, force=True):
                 break
             if stats.progress_open:
-                cmds.progressBar(
-                    stats.progress_control,
+                cmds.progressWindow(
                     edit=True,
                     progress=index,
                     status="Checking mesh {} of {}".format(
@@ -1004,11 +998,7 @@ def add_intersecting_geometry_to_selection(
     finally:
         if stats.progress_open:
             try:
-                cmds.progressBar(
-                    stats.progress_control,
-                    edit=True,
-                    endProgress=True,
-                )
+                cmds.progressWindow(endProgress=True)
             except RuntimeError:
                 pass
         stats.progress_open = False

@@ -11,17 +11,14 @@ maya = types.ModuleType("maya")
 maya_api = types.ModuleType("maya.api")
 open_maya = types.ModuleType("maya.api.OpenMaya")
 maya_cmds = types.ModuleType("maya.cmds")
-maya_mel = types.ModuleType("maya.mel")
 maya.api = maya_api
 maya.cmds = maya_cmds
-maya.mel = maya_mel
 maya_api.OpenMaya = open_maya
 
 sys.modules.setdefault("maya", maya)
 sys.modules.setdefault("maya.api", maya_api)
 sys.modules.setdefault("maya.api.OpenMaya", open_maya)
 sys.modules.setdefault("maya.cmds", maya_cmds)
-sys.modules.setdefault("maya.mel", maya_mel)
 
 selector = importlib.import_module("maya_intersection_selector")
 
@@ -82,32 +79,34 @@ class GeometryFilterTests(unittest.TestCase):
         )
         self.assertEqual(disqualified, 1)
 
-    def test_cancel_poll_pumps_events_and_reads_main_progress_bar(self):
+    def test_cancel_poll_pumps_events_and_reads_progress_window(self):
         stats = selector.IntersectionStats(1)
         stats.progress_open = True
-        stats.progress_control = "mainProgressBar"
         calls = []
 
         missing = object()
-        original_progress_bar = getattr(selector.cmds, "progressBar", missing)
+        original_progress_window = getattr(
+            selector.cmds,
+            "progressWindow",
+            missing,
+        )
         original_pump = selector._pump_ui_events
         selector._pump_ui_events = lambda: calls.append("pumped")
-        selector.cmds.progressBar = lambda control, **kwargs: (
-            calls.append((control, kwargs)) or True
+        selector.cmds.progressWindow = lambda **kwargs: (
+            calls.append(kwargs) or True
         )
         try:
             self.assertTrue(selector._cancel_requested(stats, force=True))
         finally:
             selector._pump_ui_events = original_pump
-            if original_progress_bar is missing:
-                del selector.cmds.progressBar
+            if original_progress_window is missing:
+                del selector.cmds.progressWindow
             else:
-                selector.cmds.progressBar = original_progress_bar
+                selector.cmds.progressWindow = original_progress_window
 
         self.assertEqual(calls[0], "pumped")
-        self.assertEqual(calls[1][0], "mainProgressBar")
         self.assertEqual(
-            calls[1][1],
+            calls[1],
             {"query": True, "isCancelled": True},
         )
 

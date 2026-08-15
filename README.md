@@ -54,7 +54,7 @@ Candidates must also be visible in the active model panel. The filter honors:
 eligible when it is outside the camera frame or visually occluded by another
 object.
 
-The search uses Maya's main progress bar. Press **Escape** to cancel; any
+The search opens a floating progress window. Press **Escape** to cancel; any
 intersections found before cancellation are still added to the selection.
 Hidden and Isolate Select-excluded meshes are filtered first, so they do not
 count toward the progress total.
