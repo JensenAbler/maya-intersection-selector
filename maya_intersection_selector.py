@@ -55,6 +55,108 @@ def _selected_mesh_shapes() -> list[str]:
     return sorted(shapes)
 
 
+def _active_model_panel() -> str | None:
+    """Return the active model panel, even when the Script Editor has focus."""
+
+    focused_panel = cmds.getPanel(withFocus=True)
+    if focused_panel and cmds.getPanel(typeOf=focused_panel) == "modelPanel":
+        return focused_panel
+
+    model_panels = cmds.getPanel(type="modelPanel") or []
+    for panel in model_panels:
+        if cmds.modelEditor(panel, query=True, activeView=True):
+            return panel
+
+    visible_panels = set(cmds.getPanel(visiblePanels=True) or [])
+    for panel in model_panels:
+        if panel in visible_panels:
+            return panel
+
+    return None
+
+
+def _dag_lineage(node: str) -> list[str]:
+    """Return a DAG node followed by each of its parents."""
+
+    lineage = []
+    current = node
+    while current:
+        lineage.append(current)
+        parents = cmds.listRelatives(current, parent=True, fullPath=True) or []
+        current = parents[0] if parents else None
+    return lineage
+
+
+def _is_dag_visible(shape: str) -> bool:
+    """Check Maya DAG, draw-override, and display-layer visibility."""
+
+    for node in _dag_lineage(shape):
+        if cmds.attributeQuery("visibility", node=node, exists=True):
+            if not cmds.getAttr(node + ".visibility"):
+                return False
+
+        if cmds.attributeQuery("lodVisibility", node=node, exists=True):
+            if not cmds.getAttr(node + ".lodVisibility"):
+                return False
+
+        if (
+            cmds.attributeQuery("overrideEnabled", node=node, exists=True)
+            and cmds.getAttr(node + ".overrideEnabled")
+            and cmds.attributeQuery("overrideVisibility", node=node, exists=True)
+            and not cmds.getAttr(node + ".overrideVisibility")
+        ):
+            return False
+
+        display_layers = cmds.listConnections(node, type="displayLayer") or []
+        for layer in set(display_layers):
+            if cmds.attributeQuery("visibility", node=layer, exists=True):
+                if not cmds.getAttr(layer + ".visibility"):
+                    return False
+
+    return True
+
+
+def _is_in_isolate_set(shape: str, panel: str) -> bool:
+    """Check whether a mesh is included in a panel's Isolate Select set."""
+
+    if not cmds.isolateSelect(panel, query=True, state=True):
+        return True
+
+    isolate_set = cmds.isolateSelect(panel, query=True, viewObjects=True)
+    if not isolate_set:
+        return False
+
+    lineage = set(_dag_lineage(shape))
+
+    # Isolate Select normally stores transforms. Test shapes and ancestors so
+    # selecting a group also admits all mesh descendants beneath that group.
+    for node in lineage:
+        try:
+            if cmds.sets(node, isMember=isolate_set):
+                return True
+        except RuntimeError:
+            pass
+
+    # Component isolation can store component strings rather than the object.
+    members = cmds.sets(isolate_set, query=True) or []
+    for member in members:
+        member_nodes = cmds.ls(member, long=True, objectsOnly=True) or []
+        if lineage.intersection(member_nodes):
+            return True
+
+    return False
+
+
+def _is_visible_in_panel(shape: str, panel: str) -> bool:
+    """Return whether Maya considers a mesh drawable in a model panel."""
+
+    if not cmds.modelEditor(panel, query=True, polymeshes=True):
+        return False
+    if not _is_dag_visible(shape):
+        return False
+    return _is_in_isolate_set(shape, panel)
+
+
 def _bounding_boxes_overlap(a, b, tolerance: float) -> bool:
     """Run a fast world-space broad-phase bounding-box test."""
 
@@ -173,11 +275,14 @@ def _meshes_intersect(
 
 def add_intersecting_geometry_to_selection(
     tolerance: float = DEFAULT_TOLERANCE,
+    panel: str | None = None,
 ) -> list[str]:
     """Add every scene mesh intersecting the selected meshes to the selection.
 
     Args:
         tolerance: World-space tolerance used for touching-surface tests.
+        panel: Model panel whose visibility state should be honored. When
+            omitted, the active or most recently active model panel is used.
 
     Returns:
         Long names of the mesh transforms added to the selection.
@@ -194,6 +299,12 @@ def add_intersecting_geometry_to_selection(
         cmds.warning("Select at least one polygon mesh.")
         return []
 
+    panel = panel or _active_model_panel()
+    model_panels = cmds.getPanel(type="modelPanel") or []
+    if not panel or panel not in model_panels:
+        cmds.warning("No active Maya model panel was found.")
+        return []
+
     source_data = [MeshData(shape) for shape in source_shapes]
     source_transforms = {mesh.transform for mesh in source_data}
     scene_shapes = cmds.ls(type="mesh", long=True, noIntermediate=True) or []
@@ -202,6 +313,9 @@ def add_intersecting_geometry_to_selection(
     cmds.waitCursor(state=True)
     try:
         for candidate_shape in scene_shapes:
+            if not _is_visible_in_panel(candidate_shape, panel):
+                continue
+
             candidate = MeshData(candidate_shape)
             if candidate.transform in source_transforms:
                 continue
