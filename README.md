@@ -18,6 +18,10 @@ The script uses Maya Python API 2.0 and does not modify scene geometry.
 
 - Autodesk Maya with Python 3 support
 
+The intersection calls use keyword arguments for optional acceleration and
+tolerance settings. This avoids a Maya 2025.1 API binding error triggered when
+unused face and triangle ID filters are explicitly passed as `None`.
+
 ## Install
 
 Copy `maya_intersection_selector.py` into a directory on Maya's Python path. Maya's user scripts directory is one convenient option:

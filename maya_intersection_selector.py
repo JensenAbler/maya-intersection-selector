@@ -198,11 +198,8 @@ def _edges_hit_mesh(source: MeshData, target: MeshData, tolerance: float) -> boo
             om.MSpace.kWorld,
             1.0,
             False,
-            None,
-            None,
-            False,
-            target.accel,
-            tolerance,
+            accelParams=target.accel,
+            tolerance=tolerance,
         )
         if hit:
             return True
@@ -226,11 +223,8 @@ def _point_inside_mesh(point, target: MeshData, tolerance: float) -> bool:
         om.MSpace.kWorld,
         1e10,
         False,
-        None,
-        None,
-        False,
-        target.accel,
-        tolerance,
+        accelParams=target.accel,
+        tolerance=tolerance,
     )
     if not hits:
         return False
