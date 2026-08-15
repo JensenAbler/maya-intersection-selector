@@ -151,6 +151,25 @@ class GeometryFilterTests(unittest.TestCase):
             ],
         )
 
+    def test_progress_window_none_result_is_treated_as_open(self):
+        stats = selector.IntersectionStats(3)
+        missing = object()
+        original_progress_window = getattr(
+            selector.cmds,
+            "progressWindow",
+            missing,
+        )
+        selector.cmds.progressWindow = lambda **kwargs: None
+        try:
+            selector._open_progress_window(stats, 3)
+        finally:
+            if original_progress_window is missing:
+                del selector.cmds.progressWindow
+            else:
+                selector.cmds.progressWindow = original_progress_window
+
+        self.assertTrue(stats.progress_open)
+
     def test_bounding_boxes_reject_separated_meshes(self):
         left = (0, 0, 0, 1, 1, 1)
         right = (2, 0, 0, 3, 1, 1)

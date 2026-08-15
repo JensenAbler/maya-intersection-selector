@@ -706,6 +706,25 @@ def _update_progress_window(
         stats.progress_open = False
 
 
+def _open_progress_window(stats: IntersectionStats, scene_mesh_count: int) -> None:
+    """Open the progress window, accepting Maya's None-on-success result."""
+
+    try:
+        creation_result = cmds.progressWindow(
+            title="Select Intersecting Geometry",
+            status="Starting viewport visibility scan...",
+            progress=0,
+            maxValue=max(scene_mesh_count + 1, 1),
+            isInterruptable=True,
+        )
+        # Some Maya versions return None after successfully creating the
+        # window. Only an explicit False means another window owns it.
+        stats.progress_open = creation_result is not False
+    except RuntimeError:
+        # The search can still run if another progress window is open.
+        stats.progress_open = False
+
+
 def _cancel_requested(stats: IntersectionStats, force=False) -> bool:
     """Pump UI events and poll cancellation at a bounded frequency."""
 
@@ -952,19 +971,7 @@ def add_intersecting_geometry_to_selection(
     candidates = []
 
     try:
-        try:
-            stats.progress_open = bool(
-                cmds.progressWindow(
-                    title="Select Intersecting Geometry",
-                    status="Starting viewport visibility scan...",
-                    progress=0,
-                    maxValue=max(len(scene_shapes) + 1, 1),
-                    isInterruptable=True,
-                )
-            )
-        except RuntimeError:
-            # The search can still run if another progress window is open.
-            pass
+        _open_progress_window(stats, len(scene_shapes))
 
         visibility_started_at = time.perf_counter()
         visibility = PanelVisibility(panel)
